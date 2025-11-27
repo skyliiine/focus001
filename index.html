@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FocusFlow - Smart Pomodoro</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+      body {
+        font-family: 'Inter', sans-serif;
+        background-color: #0f172a;
+        color: #e2e8f0;
+      }
+      /* Custom scrollbar */
+      ::-webkit-scrollbar { width: 8px; }
+      ::-webkit-scrollbar-track { background: #1e293b; }
+      ::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+      ::-webkit-scrollbar-thumb:hover { background: #64748b; }
+    </style>
+    <!-- Import Maps for external libraries -->
+    <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@18.2.0",
+        "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+        "lucide-react": "https://esm.sh/lucide-react@0.292.0",
+        "recharts": "https://esm.sh/recharts@2.12.7",
+        "@google/genai": "https://esm.sh/@google/genai"
+      }
+    }
+    </script>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel" data-type="module">
+        import React, { useState, useEffect, useRef, useMemo } from 'react';
+        import { createRoot } from 'react-dom/client';
+        import { Play, Pause, RotateCcw, Plus, Trash2, CheckCircle, History, Timer, ChevronRight, Zap, Clock } from 'lucide-react';
+        import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Cell } from 'recharts';
+        import { GoogleGenAI } from '@google/genai';
+
+        // --- CONFIGURATION ---
+        // 在此处填入你的 Google API Key 以启用 AI 鼓励语功能
+        // Enter your Google API Key here to enable AI motivation
+        const API_KEY = ""; 
+
+        // --- CONSTANTS ---
+        const TimerMode = {
+            FOCUS: 'FOCUS',
+            SHORT_BREAK: 'SHORT_BREAK',
+            LONG_BREAK: 'LONG_BREAK',
+        };
+
+        const TIMER_SETTINGS = {
+            [TimerMode.FOCUS]: 25 * 60,
+            [TimerMode.SHORT_BREAK]: 5 * 60,
+            [TimerMode.LONG_BREAK]: 15 * 60,
+        };
+
+        const COLORS = {
+            [TimerMode.FOCUS]: 'text-indigo-400',
+            [TimerMode.SHORT_BREAK]: 'text-emerald-400',
+            [TimerMode.LONG_BREAK]: 'text-blue-400',
+        };
+
+        const RING_COLORS = {
+            [TimerMode.FOCUS]: '#818cf8',
+            [TimerMode.SHORT_BREAK]: '#34d399',
+            [TimerMode.LONG_BREAK]: '#60a5fa',
+        };
+
+        const PRESET_TASKS = [
+            "深度阅读 (Reading)",
+            "代码开发 (Coding)",
+            "写作撰稿 (Writing)",
+            "邮件处理 (Emails)",
+            "复习/学习 (Study)",
+            "冥想休息 (Meditation)",
+            "每日规划 (Planning)",
+            "头脑风暴 (Brainstorming)"
+        ];
+
+        // --- SERVICE: GEMINI ---
+        const generateMotivationalMessage = async (taskTitle) => {
+            if (!API_KEY) return "Great job! Keep up the momentum.";
+
+            try {
+                const ai = new GoogleGenAI({ apiKey: API_KEY });
+                const response = await ai.models.generateContent({
+                    model: 'gemini-2.5-flash',
+                    contents: `I just finished a 25-minute focus session working on "${taskTitle}". 
+                    Give me a very short (max 15 words), witty, and encouraging congratulatory message. 
+                    Do not include quotes around the message.`,
+                });
+                return response.text.trim();
+            } catch (error) {
+                console.error("Failed to fetch motivation:", error);
+                return "Session complete! You're doing great.";
+            }
+        };
+
+        // --- COMPONENT: CircularTimer ---
+        const CircularTimer = ({ size, strokeWidth, timeLeft, totalTime, mode, children }) => {
+            const center = size / 2;
+            const radius = size / 2 - strokeWidth / 2;
+            const circumference = 2 * Math.PI * radius;
+            
+            const progress = timeLeft / totalTime;
+            const strokeDashoffset = circumference * (1 - progress);
+            const color = RING_COLORS[mode];
+
+            return (
+                <div className="relative flex items-center justify-center" style={{ width: size, height: size }}>
+                    <svg className="transform -rotate-90 transition-all duration-500" width={size} height={size}>
+                        <circle
+                            className="text-slate-700"
+                            stroke="currentColor"
+                            strokeWidth={strokeWidth}
+                            fill="transparent"
+                            r={radius}
+                            cx={center}
+                            cy={center}
+                        />
+                        <circle
+                            stroke={color}
+                            strokeWidth={strokeWidth}
+                            fill="transparent"
+                            r={radius}
+                            cx={center}
+                            cy={center}
+                            strokeDasharray={circumference}
+                            strokeDashoffset={strokeDashoffset}
+                            strokeLinecap="round"
+                            className="transition-all duration-1000 ease-linear"
+                        />
+                    </svg>
+                    <div className="absolute inset-0 flex items-center justify-center flex-col">
+                        {children}
+                    </div>
+                </div>
+            );
+        };
+
+        // --- COMPONENT: HistoryStats ---
+        const HistoryStats = ({ history }) => {
+            const chartData = useMemo(() => {
+                const last7Days = new Map();
+                for (let i = 6; i >= 0; i--) {
+                    const d = new Date();
+                    d.setDate(d.getDate() - i);
+                    const key = d.toLocaleDateString('en-US', { weekday: 'short' });
+                    last7Days.set(key, 0);
+                }
+
+                history.forEach(record => {
+                    const d = new Date(record.completedAt);
+                    const key = d.toLocaleDateString('en-US', { weekday: 'short' });
+                    if (last7Days.has(key)) {
+                        last7Days.set(key, (last7Days.get(key) || 0) + (record.durationSeconds / 60));
+                    }
+                });
+
+                return Array.from(last7Days.entries()).map(([name, minutes]) => ({
+                    name,
+                    minutes: Math.round(minutes),
+                }));
+            }, [history]);
+
+            const sortedHistory = [...history].sort((a, b) => 
+                new Date(b.completedAt).getTime() - new Date(a.completedAt).getTime()
+            );
+
+            return (
+                <div className="space-y-6 w-full max-w-2xl animate-in fade-in duration-500">
+                    <div className="bg-slate-800/50 backdrop-blur-md p-6 rounded-2xl border border-slate-700 shadow-xl">
+                        <h3 className="text-lg font-semibold mb-4 text-slate-200 flex items-center gap-2">
+                            <Zap className="w-5 h-5 text-yellow-400" />
+                            Weekly Focus (Minutes)
+                        </h3>
+                        <div className="h-48 w-full">
+                            <ResponsiveContainer width="100%" height="100%">
+                                <BarChart data={chartData}>
+                                    <XAxis dataKey="name" stroke="#94a3b8" fontSize={12} tickLine={false} axisLine={false} />
+                                    <Tooltip 
+                                        contentStyle={{ backgroundColor: '#1e293b', border: 'none', borderRadius: '8px', color: '#fff' }}
+                                        cursor={{fill: 'rgba(255,255,255,0.05)'}}
+                                    />
+                                    <Bar dataKey="minutes" radius={[4, 4, 0, 0]}>
+                                        {chartData.map((entry, index) => (
+                                            <Cell key={`cell-${index}`} fill="#818cf8" />
+                                        ))}
+                                    </Bar>
+                                </BarChart>
+                            </ResponsiveContainer>
+                        </div>
+                    </div>
+
+                    <div className="space-y-3">
+                        <h3 className="text-lg font-semibold text-slate-200 flex items-center gap-2">
+                            <Clock className="w-5 h-5 text-indigo-400" />
+                            Recent Sessions
+                        </h3>
+                        {sortedHistory.length === 0 ? (
+                            <div className="text-slate-500 text-center py-8 bg-slate-800/30 rounded-xl border border-slate-700/50">
+                                No sessions completed yet. Start focusing!
+                            </div>
+                        ) : (
+                            sortedHistory.map((record) => (
+                                <div key={record.id} className="bg-slate-800 p-4 rounded-xl border border-slate-700 flex flex-col gap-2 shadow-sm hover:bg-slate-750 transition-colors">
+                                    <div className="flex justify-between items-start">
+                                        <div>
+                                            <span className="font-medium text-slate-200 block">{record.taskTitle}</span>
+                                            <span className="text-xs text-slate-400">
+                                                {new Date(record.completedAt).toLocaleString()} • {Math.floor(record.durationSeconds / 60)} min
+                                            </span>
+                                        </div>
+                                        <div className="bg-indigo-500/20 text-indigo-300 text-xs px-2 py-1 rounded-full">
+                                            Completed
+                                        </div>
+                                    </div>
+                                    {record.aiMotivationalMessage && (
+                                        <div className="mt-1 text-sm text-emerald-400/90 italic border-l-2 border-emerald-500/50 pl-3">
+                                            "{record.aiMotivationalMessage}"
+                                        </div>
+                                    )}
+                                </div>
+                            ))
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        // --- MAIN COMPONENT: App ---
+        const App = () => {
+            const [view, setView] = useState('timer');
+            
+            // Task Management
+            const [tasks, setTasks] = useState(() => {
+                const saved = localStorage.getItem('focusflow_tasks');
+                return saved ? JSON.parse(saved) : [];
+            });
+            const [newTaskTitle, setNewTaskTitle] = useState('');
+
+            // History Management
+            const [history, setHistory] = useState(() => {
+                const saved = localStorage.getItem('focusflow_history');
+                return saved ? JSON.parse(saved) : [];
+            });
+
+            // Timer State
+            const [timer, setTimer] = useState({
+                mode: TimerMode.FOCUS,
+                timeLeft: TIMER_SETTINGS[TimerMode.FOCUS],
+                isRunning: false,
+                activeTaskId: null,
+            });
+
+            const completeAudioRef = useRef(null);
+
+            // Persistence
+            useEffect(() => { localStorage.setItem('focusflow_tasks', JSON.stringify(tasks)); }, [tasks]);
+            useEffect(() => { localStorage.setItem('focusflow_history', JSON.stringify(history)); }, [history]);
+
+            // Timer Logic
+            useEffect(() => {
+                let interval = null;
+                if (timer.isRunning && timer.timeLeft > 0) {
+                    interval = window.setInterval(() => {
+                        setTimer((prev) => ({ ...prev, timeLeft: prev.timeLeft - 1 }));
+                    }, 1000);
+                } else if (timer.timeLeft === 0 && timer.isRunning) {
+                    handleTimerComplete();
+                }
+                return () => { if (interval) clearInterval(interval); };
+            }, [timer.isRunning, timer.timeLeft]);
+
+            const handleTimerComplete = async () => {
+                setTimer((prev) => ({ ...prev, isRunning: false }));
+                
+                if (completeAudioRef.current) {
+                    completeAudioRef.current.play().catch(() => {});
+                }
+
+                if (timer.mode === TimerMode.FOCUS) {
+                    let motivation = '';
+                    const completedTask = tasks.find(t => t.id === timer.activeTaskId);
+                    const taskTitle = completedTask ? completedTask.title : 'Focus Session';
+
+                    motivation = await generateMotivationalMessage(taskTitle);
+
+                    const newRecord = {
+                        id: crypto.randomUUID(),
+                        taskId: timer.activeTaskId || 'generic',
+                        taskTitle: taskTitle,
+                        durationSeconds: TIMER_SETTINGS[TimerMode.FOCUS],
+                        completedAt: new Date().toISOString(),
+                        aiMotivationalMessage: motivation
+                    };
+
+                    setHistory(prev => [newRecord, ...prev]);
+
+                    if (timer.activeTaskId) {
+                        setTasks(prev => prev.map(t => {
+                            if (t.id === timer.activeTaskId) {
+                                return { ...t, completedPomodoros: t.completedPomodoros + 1 };
+                            }
+                            return t;
+                        }));
+                    }
+                }
+            };
+
+            const toggleTimer = () => setTimer(prev => ({ ...prev, isRunning: !prev.isRunning }));
+            
+            const resetTimer = () => {
+                setTimer(prev => ({
+                    ...prev,
+                    isRunning: false,
+                    timeLeft: TIMER_SETTINGS[prev.mode]
+                }));
+            };
+
+            const changeMode = (mode) => {
+                setTimer({
+                    mode,
+                    timeLeft: TIMER_SETTINGS[mode],
+                    isRunning: false,
+                    activeTaskId: timer.activeTaskId
+                });
+            };
+
+            const addTask = (e) => {
+                e.preventDefault();
+                if (!newTaskTitle.trim()) return;
+                createNewTask(newTaskTitle);
+                setNewTaskTitle('');
+            };
+
+            const createNewTask = (title) => {
+                const newTask = {
+                    id: crypto.randomUUID(),
+                    title: title,
+                    estimatedPomodoros: 1,
+                    completedPomodoros: 0,
+                    isActive: false
+                };
+                setTasks(prev => [...prev, newTask]);
+                if (!timer.activeTaskId) {
+                    setTimer(prev => ({ ...prev, activeTaskId: newTask.id }));
+                }
+            };
+
+            const selectTask = (id) => setTimer(prev => ({ ...prev, activeTaskId: id }));
+
+            const deleteTask = (id, e) => {
+                e.stopPropagation();
+                setTasks(prev => prev.filter(t => t.id !== id));
+                if (timer.activeTaskId === id) {
+                    setTimer(prev => ({ ...prev, activeTaskId: null }));
+                }
+            };
+
+            const formatTime = (seconds) => {
+                const m = Math.floor(seconds / 60);
+                const s = seconds % 60;
+                return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+            };
+
+            return (
+                <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col items-center relative overflow-hidden font-sans">
+                    <div className="absolute top-0 left-0 w-full h-full overflow-hidden pointer-events-none z-0">
+                        <div className="absolute top-[-20%] right-[-10%] w-[600px] h-[600px] rounded-full bg-indigo-900/20 blur-[100px]" />
+                        <div className="absolute bottom-[-20%] left-[-10%] w-[500px] h-[500px] rounded-full bg-emerald-900/20 blur-[100px]" />
+                    </div>
+
+                    <nav className="w-full max-w-3xl p-6 flex justify-between items-center z-10">
+                        <div className="flex items-center gap-2">
+                            <div className="w-8 h-8 bg-indigo-500 rounded-lg flex items-center justify-center shadow-lg shadow-indigo-500/20">
+                                <CheckCircle className="w-5 h-5 text-white" />
+                            </div>
+                            <h1 className="text-xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-indigo-200 to-slate-100">FocusFlow</h1>
+                        </div>
+                        <div className="flex gap-2 bg-slate-900/50 p-1 rounded-full border border-slate-800">
+                            <button 
+                                onClick={() => setView('timer')}
+                                className={`px-4 py-2 rounded-full text-sm font-medium transition-all ${view === 'timer' ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-400 hover:text-slate-200'}`}
+                            >
+                                <span className="flex items-center gap-2"><Timer className="w-4 h-4" /> Timer</span>
+                            </button>
+                            <button 
+                                onClick={() => setView('history')}
+                                className={`px-4 py-2 rounded-full text-sm font-medium transition-all ${view === 'history' ? 'bg-indigo-600 text-white shadow-lg' : 'text-slate-400 hover:text-slate-200'}`}
+                            >
+                                <span className="flex items-center gap-2"><History className="w-4 h-4" /> History</span>
+                            </button>
+                        </div>
+                    </nav>
+
+                    <main className="flex-1 w-full max-w-3xl p-4 flex flex-col items-center z-10">
+                        {view === 'timer' ? (
+                            <div className="w-full flex flex-col items-center animate-in fade-in zoom-in duration-300">
+                                <div className="mb-8 relative">
+                                    <div className="flex justify-center gap-4 mb-8">
+                                        {Object.keys(TimerMode).map((modeKey) => (
+                                            <button
+                                                key={modeKey}
+                                                onClick={() => changeMode(modeKey)}
+                                                className={`px-4 py-1.5 rounded-full text-xs font-semibold tracking-wide border transition-all ${
+                                                    timer.mode === modeKey 
+                                                    ? `bg-slate-800 border-slate-600 ${COLORS[modeKey]}` 
+                                                    : 'bg-transparent border-transparent text-slate-500 hover:bg-slate-800/50'
+                                                }`}
+                                            >
+                                                {modeKey.replace('_', ' ')}
+                                            </button>
+                                        ))}
+                                    </div>
+
+                                    <CircularTimer 
+                                        size={320} 
+                                        strokeWidth={12} 
+                                        timeLeft={timer.timeLeft} 
+                                        totalTime={TIMER_SETTINGS[timer.mode]}
+                                        mode={timer.mode}
+                                    >
+                                        <div className="text-6xl font-bold text-white tracking-tighter mb-2">
+                                            {formatTime(timer.timeLeft)}
+                                        </div>
+                                        <div className={`text-sm font-medium uppercase tracking-widest ${COLORS[timer.mode]}`}>
+                                            {timer.isRunning ? 'Running' : 'Paused'}
+                                        </div>
+                                        {timer.activeTaskId && (
+                                            <div className="mt-4 max-w-[200px] text-center truncate text-slate-400 text-sm flex items-center justify-center gap-1">
+                                                <div className="w-1.5 h-1.5 rounded-full bg-indigo-500 animate-pulse" />
+                                                {tasks.find(t => t.id === timer.activeTaskId)?.title || 'Unknown Task'}
+                                            </div>
+                                        )}
+                                    </CircularTimer>
+                                </div>
+
+                                <div className="flex items-center gap-6 mb-12">
+                                    <button 
+                                        onClick={toggleTimer}
+                                        className="w-16 h-16 rounded-2xl bg-indigo-600 hover:bg-indigo-500 text-white flex items-center justify-center shadow-xl shadow-indigo-500/20 transition-all hover:scale-105 active:scale-95"
+                                    >
+                                        {timer.isRunning ? <Pause className="w-8 h-8 fill-current" /> : <Play className="w-8 h-8 fill-current ml-1" />}
+                                    </button>
+                                    <button 
+                                        onClick={resetTimer}
+                                        className="w-12 h-12 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-300 flex items-center justify-center border border-slate-700 transition-all"
+                                    >
+                                        <RotateCcw className="w-5 h-5" />
+                                    </button>
+                                </div>
+
+                                <div className="w-full max-w-md space-y-4">
+                                    <div className="flex items-center justify-between mb-2">
+                                        <h2 className="text-lg font-semibold text-slate-200">Tasks</h2>
+                                        <span className="text-xs text-slate-500 bg-slate-900 px-2 py-1 rounded border border-slate-800">
+                                            {tasks.filter(t => t.completedPomodoros > 0).length} Completed
+                                        </span>
+                                    </div>
+
+                                    <div className="mb-2">
+                                         <div className="flex flex-wrap gap-2">
+                                            {PRESET_TASKS.map((preset) => (
+                                                <button
+                                                    key={preset}
+                                                    onClick={() => createNewTask(preset)}
+                                                    className="px-3 py-1 bg-slate-800/60 hover:bg-indigo-600/20 hover:text-indigo-300 hover:border-indigo-500/30 border border-slate-700 rounded-full text-xs text-slate-400 transition-all"
+                                                >
+                                                    + {preset}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+
+                                    <form onSubmit={addTask} className="relative group">
+                                        <input
+                                            type="text"
+                                            value={newTaskTitle}
+                                            onChange={(e) => setNewTaskTitle(e.target.value)}
+                                            placeholder="Or type a custom task..."
+                                            className="w-full bg-slate-900/50 border-2 border-slate-800 group-hover:border-slate-700 focus:border-indigo-500 rounded-xl py-3 pl-4 pr-12 outline-none transition-colors placeholder:text-slate-600"
+                                        />
+                                        <button 
+                                            type="submit"
+                                            disabled={!newTaskTitle.trim()}
+                                            className="absolute right-2 top-2 p-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg disabled:opacity-50 disabled:hover:bg-indigo-600 transition-all"
+                                        >
+                                            <Plus className="w-5 h-5" />
+                                        </button>
+                                    </form>
+
+                                    <div className="space-y-2 max-h-[300px] overflow-y-auto pr-1">
+                                        {tasks.map(task => (
+                                            <div 
+                                                key={task.id}
+                                                onClick={() => selectTask(task.id)}
+                                                className={`p-4 rounded-xl border transition-all cursor-pointer flex items-center justify-between group ${
+                                                    timer.activeTaskId === task.id 
+                                                    ? 'bg-slate-800/80 border-indigo-500/50 shadow-lg shadow-indigo-900/20' 
+                                                    : 'bg-slate-900/30 border-slate-800 hover:border-slate-700'
+                                                }`}
+                                            >
+                                                <div className="flex items-center gap-3 overflow-hidden">
+                                                    <div className={`w-5 h-5 rounded-full border-2 flex items-center justify-center ${
+                                                        timer.activeTaskId === task.id ? 'border-indigo-500' : 'border-slate-600'
+                                                    }`}>
+                                                        {timer.activeTaskId === task.id && <div className="w-2.5 h-2.5 rounded-full bg-indigo-500" />}
+                                                    </div>
+                                                    <div>
+                                                        <p className={`font-medium truncate ${timer.activeTaskId === task.id ? 'text-white' : 'text-slate-400'}`}>
+                                                            {task.title}
+                                                        </p>
+                                                        <p className="text-xs text-slate-600">
+                                                            {task.completedPomodoros} / {task.estimatedPomodoros} sessions
+                                                        </p>
+                                                    </div>
+                                                </div>
+                                                <button 
+                                                    onClick={(e) => deleteTask(task.id, e)}
+                                                    className="opacity-0 group-hover:opacity-100 p-2 hover:bg-red-500/10 hover:text-red-400 text-slate-600 rounded-lg transition-all"
+                                                >
+                                                    <Trash2 className="w-4 h-4" />
+                                                </button>
+                                            </div>
+                                        ))}
+                                        {tasks.length === 0 && (
+                                            <div className="text-center py-8 text-slate-600 italic">
+                                                No tasks added. Select a quick option above or create your own.
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        ) : (
+                            <HistoryStats history={history} />
+                        )}
+                    </main>
+                    
+                    <footer className="p-4 text-xs text-slate-600 z-10">
+                        FocusFlow &copy; {new Date().getFullYear()}
+                    </footer>
+                </div>
+            );
+        };
+
+        const root = createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
